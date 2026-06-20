@@ -132,12 +132,25 @@ export class SpaceAudio {
   //    listing, so just dropping files in the folder picks them up. ──
   setBackgroundFolder(url) {
     this._bgFolder = url;
+    // Prefer a manifest (sound/tracks.json) — required on static hosts like
+    // GitHub Pages that don't serve directory listings. Fall back to parsing a
+    // directory listing (works with `python -m http.server` for local dev).
+    fetch(url + 'tracks.json')
+      .then(r => (r.ok ? r.json() : Promise.reject()))
+      .then(names => {
+        if (!Array.isArray(names) || !names.length) throw 0;
+        this._playlist = names.map(n => url + encodeURIComponent(n));
+        this._maybeStartBg();
+      })
+      .catch(() => this._loadFromListing(url));
+  }
+  _loadFromListing(url) {
     fetch(url).then(r => r.text()).then(html => {
       const re = /href="([^"?]+\.mp3)"/gi, list = []; let m;
       while ((m = re.exec(html))) list.push(url + m[1]);
       this._playlist = list;
       this._maybeStartBg();
-    }).catch(() => { this._playlist = []; });   // no listing → keep the drone
+    }).catch(() => { this._playlist = []; });   // nothing found → keep the drone
   }
   _maybeStartBg() {
     if (!this.ctx || this.ctx.state !== 'running' || !this._playlist || !this._playlist.length) return;

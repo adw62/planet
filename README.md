@@ -60,10 +60,17 @@ Earth / Venus / Mars / Snowball outcomes diverge within seconds.
 All SFX are synthesised at runtime (no asset files). Browsers block audio until
 a user gesture, so it unlocks on your first click.
 
-**Background music (optional):** drop any `.mp3` files into the **`sound/`**
-folder. The app reads the directory listing and **cycles through every track**,
-fading them in as a quiet bed under the SFX (it falls back to the synth drone if
-the folder is empty or the server doesn't list directories).
+**Background music (optional):** drop `.mp3` files into the **`sound/`** folder
+and list them in **`sound/tracks.json`** — the app cycles through every track,
+fading them in as a quiet bed under the SFX. The manifest is required on static
+hosts (e.g. GitHub Pages) that don't serve directory listings; locally it can
+fall back to the directory listing. Regenerate it with:
+
+```bash
+cd sound && ls *.mp3 | python3 -c "import sys,json;print(json.dumps([l.strip() for l in sys.stdin]))" > tracks.json
+```
+
+If there are no tracks it falls back to the synth drone.
 
 ## Notes
 
