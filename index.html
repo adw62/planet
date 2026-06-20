@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ΔV — Procedural Planet Forge</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #000; color: #cdd; font-family: monospace; overflow: hidden; }
+canvas { display: block; }
+
+#ui {
+  position: fixed; top: 12px; left: 12px; z-index: 10;
+  background: rgba(9,13,22,0.72); border: 1px solid rgba(120,160,220,0.18);
+  border-radius: 10px; padding: 13px 15px; display: flex; flex-direction: column; gap: 9px;
+  width: 256px; max-height: calc(100vh - 24px); overflow-y: auto;
+  backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+  box-shadow: 0 8px 40px rgba(0,0,0,0.55);
+}
+#ui h1 { font-size: 13px; color: #bdeaff; letter-spacing: 2px; text-shadow: 0 0 12px rgba(120,200,255,0.5); }
+#ui h2 { font-size: 10px; color: #678; letter-spacing: 1.5px; text-transform: uppercase;
+         border-top: 1px solid #223; padding-top: 8px; margin-top: 2px; }
+#ui label { font-size: 11px; color: #899; }
+#ui input[type=number], #ui select {
+  width: 100%; background: #111a28; border: 1px solid #334;
+  color: #cde; padding: 3px 6px; font-family: monospace; font-size: 12px; border-radius: 3px;
+}
+.row { display: flex; gap: 8px; align-items: center; }
+input[type=range] { width: 100%; accent-color: #4af; height: 16px; }
+.slider .lbl { display: flex; justify-content: space-between; font-size: 11px; color: #9ab; }
+.slider .lbl b { color: #cef; font-weight: normal; }
+button { font-family: monospace; cursor: pointer; border-radius: 4px; }
+.btn-primary { background: #1a3a6a; border: 1px solid #4488cc; color: #adf; font-size: 12px; padding: 5px 10px; letter-spacing: 0.5px; }
+.btn-primary:hover { background: #234e8a; }
+.btn-mini { background: #111a28; border: 1px solid #334; color: #7af; font-size: 11px; padding: 3px 8px; }
+.btn-event { background: #1a2a3a; border: 1px solid #4488aa; color: #9cf; font-size: 12px; padding: 6px 10px; width: 100%; }
+.btn-event:hover { background: #21384c; }
+.btn-event:disabled { opacity: 0.4; cursor: default; }
+
+/* time transport */
+#time .seg { display: flex; gap: 4px; }
+#time button { flex: 1; background: #111a28; border: 1px solid #334; color: #89a; font-size: 12px; padding: 4px 0; }
+#time button.on { color: #cef; border-color: #4af; background: #16263c; }
+#age { font-size: 11px; color: #7cf; text-align: center; margin-top: 2px; }
+
+/* dashboard */
+#dash { display: flex; flex-direction: column; gap: 5px; }
+#archetype { font-size: 13px; color: #ffd27a; text-align: center; padding: 4px; letter-spacing: 0.5px;
+             background: rgba(255,200,100,0.06); border: 1px solid #3a3320; border-radius: 4px; }
+.stat { font-size: 10px; color: #9ab; }
+.stat .top { display: flex; justify-content: space-between; }
+.stat .top b { color: #def; font-weight: normal; }
+.bar { height: 4px; background: #1a2030; border-radius: 2px; margin-top: 2px; overflow: hidden; }
+.bar > div { height: 100%; width: 0%; border-radius: 2px; transition: width 0.15s linear; }
+.comp-bar { display: flex; height: 7px; border-radius: 2px; overflow: hidden; margin-top: 3px; background: #0c1018; }
+.comp-bar > div { height: 100%; width: 0; transition: width 0.2s linear; }
+.comp-legend { font-size: 9px; color: #89a; margin-top: 3px; display: flex; gap: 9px; flex-wrap: wrap; }
+.comp-legend b { font-weight: normal; }
+.airless .comp-bar, .airless .comp-legend { opacity: 0.3; }
+#info { font-size: 10px; color: #566; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+
+<div id="ui">
+  <h1>PLANET FORGE</h1>
+
+  <div class="row">
+    <input type="number" id="inp-seed" value="42" style="flex:1">
+    <button class="btn-mini" id="btn-rng" title="Random seed">⟳</button>
+  </div>
+  <label>Base surface</label>
+  <select id="inp-type"></select>
+  <button class="btn-primary" id="btn-gen">⊕ NEW WORLD</button>
+
+  <h2>Time</h2>
+  <div id="time">
+    <div class="seg">
+      <button data-speed="0">❙❙</button>
+      <button data-speed="1">▶</button>
+      <button data-speed="4" class="on">▶▶</button>
+      <button data-speed="12">▶▶▶</button>
+    </div>
+    <div id="age">0 Myr</div>
+  </div>
+
+  <h2>Macro controls</h2>
+  <div class="slider" data-key="solarFlux">
+    <div class="lbl"><span>☀ Solar radiation</span><b class="val"></b></div>
+    <input type="range" min="0.2" max="3" step="0.02" value="1">
+  </div>
+  <div class="slider" data-key="gravity">
+    <div class="lbl"><span>⬇ Gravity / mass</span><b class="val"></b></div>
+    <input type="range" min="0.2" max="3" step="0.02" value="1">
+  </div>
+  <div class="slider" data-key="coreHeat">
+    <div class="lbl"><span>🜂 Core heat</span><b class="val"></b></div>
+    <input type="range" min="0" max="1" step="0.02" value="0.8">
+  </div>
+  <div class="slider" data-key="tectonicInput">
+    <div class="lbl"><span>⛰ Tectonic activity</span><b class="val"></b></div>
+    <input type="range" min="0" max="1" step="0.02" value="0.5">
+  </div>
+  <label>Impactor payload</label>
+  <select id="comet-type"></select>
+  <button class="btn-event" id="btn-comet">☄ CRASH IMPACTOR</button>
+
+  <h2>Readout</h2>
+  <div id="dash">
+    <div id="archetype">Temperate</div>
+    <div class="stat" id="st-temp"><div class="top"><span>Surface temp</span><b></b></div><div class="bar"><div></div></div></div>
+    <div class="stat" id="st-ocean"><div class="top"><span>Ocean cover</span><b></b></div><div class="bar"><div></div></div></div>
+    <div class="stat" id="st-ice"><div class="top"><span>Ice cover</span><b></b></div><div class="bar"><div></div></div></div>
+    <div class="stat" id="st-atm">
+      <div class="top"><span>Atmosphere</span><b></b></div>
+      <div class="comp-bar"><div data-g="N₂"></div><div data-g="CO₂"></div><div data-g="H₂O"></div></div>
+      <div class="comp-legend"></div>
+    </div>
+    <div class="stat" id="st-mag"><div class="top"><span>Magnetic field</span><b></b></div><div class="bar"><div></div></div></div>
+    <div class="stat" id="st-hab"><div class="top"><span>Habitability</span><b></b></div><div class="bar"><div></div></div></div>
+    <div class="stat" id="st-bio"><div class="top"><span>Biosphere</span><b></b></div><div class="bar"><div></div></div></div>
+  </div>
+
+  <button class="btn-mini on" id="btn-sound" style="width:100%;margin-top:2px">🔊 SOUND ON</button>
+  <button class="btn-mini" id="btn-share" style="width:100%;margin-top:2px">⧉ COPY SHARE LINK</button>
+  <div id="info">scroll to zoom · drag to orbit</div>
+</div>
+
+<script type="module" src="./js/main.js"></script>
+</body>
+</html>
