@@ -285,6 +285,38 @@ export class FluidClouds {
     this.f.target = cover; this.f.windScale = windScale;
     this.mat.uniforms.cloudColor.value.copy(color);
   }
+  // Punch a one-off burst of density (+ a brief outward velocity kick, so it
+  // visibly billows out before normal wind takes over) directly into the
+  // solver at a given spot — e.g. a nuke detonating. uFrac/vFrac are
+  // longitude/latitude fractions in [0,1), using the same grid convention as
+  // the obstacle mask in planet.js's _buildCloudSolid (x/S, y/S).
+  spawnBurst(uFrac, vFrac, amount = 3, radius = 4) {
+    const f = this.f;
+    const ci = Math.round((((uFrac % 1) + 1) % 1) * GX);
+    const cj = Math.min(GY - 1, Math.max(0, Math.round(vFrac * GY)));
+    // radius must be a whole number of grid cells — the loop below steps the
+    // bound by integer 1, so a fractional radius would make di/dj fractional
+    // and silently no-op every f.d[id] write (typed arrays ignore non-integer
+    // indices) instead of throwing, so this is easy to break by accident.
+    radius = Math.max(1, Math.round(radius));
+    for (let dj = -radius; dj <= radius; dj++) {
+      const jj = cj + dj;
+      if (jj < 0 || jj >= GY) continue;
+      for (let di = -radius; di <= radius; di++) {
+        const dist = Math.hypot(di, dj);
+        if (dist > radius) continue;
+        let ii = ci + di; if (ii < 0) ii += GX; else if (ii >= GX) ii -= GX;
+        const id = ii + jj * GX;
+        const k = 1 - dist / radius;
+        const amt = amount * k * k;
+        f.d[id] = Math.min(4, f.d[id] + amt);
+        if (dist > 0.001) {
+          f.u[id] += (di / dist) * amt * 1.2;
+          f.v[id] += (dj / dist) * amt * 1.2;
+        }
+      }
+    }
+  }
   update(dt) {
     // shader detail + rotation run every frame (smooth); the SOLVER runs at
     // ~30 Hz with a proportionally larger dt — same motion & coverage, ~half

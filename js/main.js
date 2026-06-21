@@ -35,6 +35,8 @@ controls.enableDamping = true; controls.dampingFactor = 0.07;
 controls.minDistance = 13; controls.maxDistance = 200;
 controls.autoRotate = false;
 
+const TRACK_AXIS = new THREE.Vector3(0, 1, 0);   // world up — planetMesh only ever spins about this
+
 // The sun: a directional light for the terminator + a visible glowing star
 // that bloom turns into a real light source on screen.
 const SUN_DIR = new THREE.Vector3(8, 5, 10).normalize();
@@ -295,6 +297,166 @@ function updateDash() {
   bar('st-bio',   sim.biosphere*100, sim.civilization > 0.05 ? '#ffd27a' : '#5cbf5c', bioTxt);
 }
 
+// In-world hover UI: shield/tech-rush buttons float over a city's current
+// (spinning) screen position when the mouse gets close, instead of living in
+// the dashboard list — clicking a city directly reads better for a "god
+// power" than a sidebar button.
+const HOVER_RADIUS = 60;       // px — how close the mouse must be to reveal the buttons
+const cityHoverLayer = document.createElement('div');
+cityHoverLayer.id = 'city-hover-layer';
+document.body.appendChild(cityHoverLayer);
+let cityBtnEls = null;
+
+// health bars float under each city, always visible once war starts —
+// unlike the power buttons, not gated on mouse proximity. A defeated
+// faction's whole UI (bar + buttons) disappears for good, same tick.
+const cityHpLayer = document.createElement('div');
+cityHpLayer.id = 'city-hp-layer';
+document.body.appendChild(cityHpLayer);
+let cityHpEls = null;
+
+// a small white dot marks each city's center, always visible (no hover
+// needed) — click it to have the camera track that city as the planet
+// spins; any manual orbit/drag of the camera drops back to free-cam.
+const cityDotLayer = document.createElement('div');
+cityDotLayer.id = 'city-dot-layer';
+document.body.appendChild(cityDotLayer);
+let cityDotEls = null;
+let trackedCityId = null;
+let lastPlanetRotY = null;
+
+let mouseX = -9999, mouseY = -9999;
+window.addEventListener('mousemove', (e) => { mouseX = e.clientX; mouseY = e.clientY; });
+
+cityHoverLayer.addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-act]');
+  if (!btn) return;
+  const id = +btn.dataset.id;
+  if (btn.dataset.act === 'shield') planet.shieldFaction(id);
+  else if (btn.dataset.act === 'rush') planet.rushTech(id);
+});
+
+cityDotLayer.addEventListener('click', (e) => {
+  const dot = e.target.closest('.city-dot');
+  if (!dot) return;
+  const id = +dot.dataset.id;
+  trackedCityId = id;
+  // snap the camera to look straight at the city (keeping the current zoom
+  // distance) so tracking starts centered instead of wherever it was clicked
+  const { pos } = planet.getCityWorldPositions()[id];
+  const dist = camera.position.length();
+  camera.position.copy(pos).normalize().multiplyScalar(dist);
+});
+
+// dragging to rotate/pan/zoom no longer drops tracking — the camera keeps
+// following the city through all of that. Tracking only ends when the user
+// plainly clicks (no drag) on empty space: a pointerdown/up pair on the
+// canvas itself with barely any movement between them. UI elements (the dot,
+// power buttons, health bars) sit on top of the canvas and consume their own
+// clicks, so they never reach this listener — no extra filtering needed.
+let canvasDownPos = null;
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  canvasDownPos = { x: e.clientX, y: e.clientY };
+});
+renderer.domElement.addEventListener('pointerup', (e) => {
+  if (!canvasDownPos) return;
+  const moved = Math.hypot(e.clientX - canvasDownPos.x, e.clientY - canvasDownPos.y);
+  canvasDownPos = null;
+  if (moved < 4) trackedCityId = null;
+});
+
+function ensureCityHoverEls(count) {
+  if (cityBtnEls && cityBtnEls.length === count) return;
+  cityHoverLayer.innerHTML = '';
+  cityBtnEls = Array.from({ length: count }, (_, id) => {
+    const el = document.createElement('div');
+    el.className = 'city-powers';
+    el.innerHTML = `<button class="fbtn" data-act="shield" data-id="${id}" title="Shield">🛡</button><button class="fbtn" data-act="rush" data-id="${id}" title="Tech Rush">⚡</button>`;
+    cityHoverLayer.appendChild(el);
+    return el;
+  });
+  cityHpLayer.innerHTML = '';
+  cityHpEls = Array.from({ length: count }, () => {
+    const el = document.createElement('div');
+    el.className = 'city-hp';
+    el.innerHTML = `<div class="city-hp-fill"></div>`;
+    cityHpLayer.appendChild(el);
+    return el;
+  });
+  cityDotLayer.innerHTML = '';
+  cityDotEls = Array.from({ length: count }, (_, id) => {
+    const el = document.createElement('div');
+    el.className = 'city-dot';
+    el.dataset.id = id;
+    el.title = 'Track this city';
+    cityDotLayer.appendChild(el);
+    return el;
+  });
+}
+
+function updateCityHoverUI() {
+  const positions = planet.getCityWorldPositions();
+  if (!positions.length) {
+    if (cityBtnEls) cityBtnEls.forEach(el => el.style.display = 'none');
+    if (cityHpEls) cityHpEls.forEach(el => el.style.display = 'none');
+    if (cityDotEls) cityDotEls.forEach(el => el.style.display = 'none');
+    trackedCityId = null;   // civilization wiped — nothing left to track
+    return;
+  }
+  ensureCityHoverEls(positions.length);
+  const w = window.innerWidth, h = window.innerHeight;
+  positions.forEach(({ pos, normal }, id) => {
+    const btnEl = cityBtnEls[id], hpEl = cityHpEls[id], dotEl = cityDotEls[id];
+    const f = planet.factions[id];
+    // a defeated faction loses its whole in-world UI — bar, buttons and dot alike
+    if (f.defeated) {
+      btnEl.style.display = 'none'; hpEl.style.display = 'none'; dotEl.style.display = 'none';
+      if (trackedCityId === id) trackedCityId = null;
+      return;
+    }
+    const toCam = camera.position.clone().sub(pos).normalize();
+    const ndc = pos.clone().project(camera);
+    const hidden = normal.dot(toCam) < 0.05    // far side of the globe
+      || ndc.z > 1;                             // behind the camera
+    if (hidden) { btnEl.style.display = 'none'; hpEl.style.display = 'none'; dotEl.style.display = 'none'; return; }
+    const sx = (ndc.x * 0.5 + 0.5) * w, sy = (-ndc.y * 0.5 + 0.5) * h;
+
+    dotEl.style.display = 'block';
+    dotEl.style.left = `${sx}px`;
+    dotEl.style.top = `${sy}px`;
+    dotEl.classList.toggle('active', trackedCityId === id);
+
+    // health bar: always shown once war has started, sitting under the city
+    const atWar = f.targetId != null;
+    if (atWar) {
+      hpEl.style.display = 'block';
+      hpEl.style.left = `${sx}px`;
+      hpEl.style.top = `${sy}px`;
+      const fill = hpEl.firstChild;
+      fill.style.width = `${Math.max(0, f.health)}%`;
+      fill.style.background = f.health < 35 ? '#e75555' : f.health < 70 ? '#e7b855' : '#' + f.color.getHexString();
+    } else {
+      hpEl.style.display = 'none';
+    }
+
+    // power buttons: only when the mouse is right over the city
+    if (Math.hypot(sx - mouseX, sy - mouseY) > HOVER_RADIUS) { btnEl.style.display = 'none'; return; }
+    btnEl.style.display = 'flex';
+    btnEl.style.left = `${sx}px`;
+    btnEl.style.top = `${sy}px`;
+    const shieldBtn = btnEl.children[0], rushBtn = btnEl.children[1];
+    const shieldOn = f.shieldMyr > 0;
+    shieldBtn.disabled = f.shieldCooldown > 0;
+    shieldBtn.classList.toggle('active', shieldOn);
+    shieldBtn.title = shieldOn ? `Shielded — ${Math.ceil(f.shieldMyr)} Myr left`
+      : f.shieldCooldown > 0 ? `Cooldown — ${Math.ceil(f.shieldCooldown)} Myr` : 'Grant temporary damage immunity';
+    const maxedTech = f.warStage >= 3;
+    rushBtn.disabled = f.techCooldown > 0 || maxedTech;
+    rushBtn.title = maxedTech ? 'Already at max weapon tech'
+      : f.techCooldown > 0 ? `Cooldown — ${Math.ceil(f.techCooldown)} Myr` : 'Instantly advance to the next weapon stage';
+  });
+}
+
 // ── main loop ────────────────────────────────────────────────
 let _frame = 0;
 renderer.setAnimationLoop(() => {
@@ -311,7 +473,19 @@ renderer.setAnimationLoop(() => {
   }
   planet.spin(dt);
   comets.update(dt);
+
+  // camera tracking: mirror the planet's spin onto the camera's orbit
+  // position so a tracked city stays centered on screen — independent of
+  // any drag/zoom the user does meanwhile (see the pointerdown/up listener
+  // above for how tracking actually ends).
+  const rotY = planet.planetMesh ? planet.planetMesh.rotation.y : 0;
+  if (lastPlanetRotY != null && trackedCityId != null) {
+    camera.position.applyAxisAngle(TRACK_AXIS, rotY - lastPlanetRotY);
+  }
+  lastPlanetRotY = rotY;
+
   controls.update();
+  updateCityHoverUI();
   composer.render();
 });
 

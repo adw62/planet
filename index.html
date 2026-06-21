@@ -57,6 +57,39 @@ button { font-family: monospace; cursor: pointer; border-radius: 4px; }
 .comp-legend b { font-weight: normal; }
 .airless .comp-bar, .airless .comp-legend { opacity: 0.3; }
 #info { font-size: 10px; color: #566; }
+
+.fbtn { background: #1a2a3a; border: 1px solid #345; color: #9cf; font-size: 9px; padding: 3px 6px; }
+.fbtn:hover:not(:disabled) { background: #21384c; }
+.fbtn:disabled { opacity: 0.35; cursor: default; }
+.fbtn.active { border-color: #6cf; color: #cef; background: #1e3a4c; }
+
+/* in-world city hover powers */
+#city-hover-layer { position: fixed; inset: 0; pointer-events: none; z-index: 50; }
+.city-powers { position: absolute; display: none; gap: 5px; transform: translate(-50%, -130%); }
+.city-powers .fbtn { pointer-events: auto; font-size: 13px; padding: 5px 7px; border-radius: 5px; }
+
+/* in-world city health bars */
+#city-hp-layer { position: fixed; inset: 0; pointer-events: none; z-index: 45; }
+.city-hp { position: absolute; display: none; width: 42px; height: 5px; background: #0008; border: 1px solid #345; border-radius: 3px; overflow: hidden; transform: translate(-50%, 10px); }
+.city-hp-fill { height: 100%; width: 0%; }
+
+/* in-world city tracking dot — the clickable box is bigger than the visible
+   dot (a centered ::after) so it's easy to hit without looking oversized */
+#city-dot-layer { position: fixed; inset: 0; pointer-events: none; z-index: 48; }
+.city-dot {
+  position: absolute; display: none; width: 28px; height: 28px;
+  transform: translate(-50%, -50%); pointer-events: auto; cursor: pointer;
+}
+.city-dot::after {
+  content: ''; position: absolute; left: 50%; top: 50%; width: 8px; height: 8px;
+  border-radius: 50%; background: #fff; box-shadow: 0 0 4px 1px rgba(255,255,255,0.7);
+  transform: translate(-50%, -50%);
+}
+.city-dot:hover::after { box-shadow: 0 0 6px 2px rgba(255,255,255,0.9); }
+.city-dot.active::after {
+  background: #6cf; box-shadow: 0 0 8px 3px rgba(120,200,255,0.9);
+  width: 10px; height: 10px;
+}
 </style>
 <script type="importmap">
 {

@@ -9,7 +9,7 @@
 // ─────────────────────────────────────────────────────────────
 import * as THREE from 'three';
 import { makeRng, genHeightMaps } from './noise.js';
-import { renderSurfaceTextures, buildNormalBase, paintNormalTexture, makeHeightTex } from './surface.js';
+import { renderSurfaceTextures, repaintScorch, buildNormalBase, paintNormalTexture, makeHeightTex } from './surface.js';
 import { atmosphereInfo } from './sim.js';
 import { FluidClouds, Aurora, GX as FGX, GY as FGY } from './fluidclouds.js';
 
@@ -23,6 +23,49 @@ const PLANET_SPIN = 0.05;   // rad/s — shared by the surface and the cloud dec
 // fluid obstacles, so clouds flow AROUND the peaks.
 const DISP_SCALE = 1.7, DISP_BIAS = -0.5, SPHERE_SEGS = 256;
 const CLOUD_SHELL = 1.07;
+// fixed world-space sun direction — must match main.js's directional light
+const SUN_DIR = new THREE.Vector3(8, 5, 10).normalize();
+const Y_AXIS = new THREE.Vector3(0, 1, 0);
+const Z_AXIS = new THREE.Vector3(0, 0, 1);
+// war: each faction always fights its nearest living rival, fixed damage/heal
+// rates (placeholders — tune freely), and a per-faction weapon stage that
+// only ever advances with time (military tech, not tied to any one fight).
+const WAR_CIV_THRESHOLD = 0.5;
+const WAR_MAX_HEALTH = 100;
+const WAR_HEAL_RATE = 1.5;          // HP / Myr, always-on regen
+// stage durations are generous on purpose — tanks are meant to be the long,
+// visible grind; missiles/nukes only take over once that's been watched out.
+const WAR_STAGE_MYR = [0, 150, 60]; // Myr spent at stage N before advancing to N+1 (index 1,2; stage 3 is the ceiling)
+// draft unit visuals: each faction dispatches ONE unit at a time toward its
+// current target, travelling for `travel` Myr before delivering `dmg` on
+// arrival, then sits on `cooldown` Myr before launching the next. Tanks are
+// the odd one out — they're shot at en route (see TANK_HP/TANK_DEFENSE below)
+// and can be destroyed before they arrive, dealing no damage, so the
+// attacker has to send another. Missiles/nukes always get through.
+const STAGE_KIND = [null, 'tank', 'missile', 'nuke'];
+const UNIT_TRAVEL_MYR   = { missile: 5,   nuke: 6 };   // tanks travel at a constant speed instead — see TANK_SPEED
+const UNIT_DAMAGE       = { tank: 10,  missile: 14,  nuke: 65 };
+const UNIT_COOLDOWN_MYR = { tank: 3,   missile: 6,   nuke: 10 };
+const TANK_HP = 16;          // a tank destroyed mid-transit deals zero damage
+const TANK_DEFENSE = 0.55;   // HP/Myr a *full-health* defender does to an inbound tank (scales down as it takes damage) — kept in proportion with TANK_SPEED below
+const TANK_SPEED = 0.02;     // rad/Myr of great-circle travel — constant, so far trips take proportionally longer
+const TANK_MIN_TRAVEL_MYR = 5;
+// player powers: god-level intervention on a single faction, each on its own
+// cooldown so they're a periodic nudge rather than a permanent win button.
+const SHIELD_DURATION_MYR = 40;    // Myr of total damage immunity per activation
+const SHIELD_COOLDOWN_MYR = 90;
+const TECH_RUSH_COOLDOWN_MYR = 70;
+const FOUND_CITIES = 9;        // cities present at founding
+const RESEED_NEW_CITIES = 3;   // colonies founded once a war ends in a single survivor
+const MAX_CITIES = FOUND_CITIES + RESEED_NEW_CITIES;   // hard ceiling once colonies are included
+// extinction cycle: if the biosphere collapses (runaway heat/cold, a molten
+// resurfacing, atmosphere stripped, etc.) and stays gone for a while, every
+// city/faction is wiped — civilization can't outlive the life that built it.
+// The existing founding check (civilization > 0.01 && !this._citySeeds)
+// then refounds fresh cities/factions on its own once biosphere recovers
+// enough for civilization to climb again, so the war cycle simply repeats.
+const BIO_GONE_THRESHOLD = 0.02;   // biosphere below this counts as "no life at all"
+const BIO_GONE_WIPE_MYR = 15;      // sustained Myr of bio-loss before ruins are wiped
 const clamp = (x,a,b) => x<a?a:x>b?b:x;
 function smooth(e0,e1,x){ const t=clamp((x-e0)/(e1-e0),0,1); return t*t*(3-2*t); }
 
@@ -82,6 +125,9 @@ export class PlanetView {
     this.atmMesh = null;
     this._cache = null;          // { hmap, himap, sortedHmap }
     this._last = null;           // last-rendered visual params (throttle)
+    this._lastScorch = null;
+    this._diffuseCanvas = null; this._emissiveCanvas = null;
+    this._baseDiffuseData = null; this._baseEmissiveData = null;
     this._type = 'rock';
     this._hue = 0.04;
     this.radius = RADIUS;
@@ -100,7 +146,35 @@ export class PlanetView {
     this._baseShininess = typeDef.shininess;
     this._seed = seed;
     this._citySeeds = null;     // founding-city sites, picked lazily when life industrializes
+    this._roadMask = null;      // road network mask, built alongside the city seeds
+    this._buildingSeeds = null; // per-seed skyline, built alongside the seeds
+    this._shieldMeshes = null;  // per-seed shield dome, built alongside the seeds (see shieldFaction())
+    this.factions = null;       // one faction per city seed — public, read by main.js's in-world city UI
+    this._lastWarAge = null;    // sim.age last seen by _updateWars, for Myr-based damage/heal
+    this._reseeded = false;     // whether the post-war victor colony expansion has already run
+    this._lastBioAge = null;    // sim.age last seen by _maybeWipeCivilization
+    this._bioGoneMyr = 0;       // running Myr of sustained biosphere absence, while cities exist
     this._last = null;
+    this._lastScorch = null;
+    this._diffuseCanvas = null; this._emissiveCanvas = null;   // cached for the scorch-only fast path
+    this._baseDiffuseData = null; this._baseEmissiveData = null;
+
+    // shared draft geometry for war units + impact flashes (real meshes, not
+    // instanced — at most one in-flight unit per faction, so ≤9 at a time).
+    // A "tank" is a small formation of cubes (see _buildTankFormation) rather
+    // than one big box — reads as a convoy instead of a single blob.
+    this._tankGeo = new THREE.BoxGeometry(0.07, 0.05, 0.08);
+    // cones default to apex-along-+Y; rotate -90° about X so the apex faces
+    // local -Z, matching Object3D.lookAt's "-Z points at target" convention
+    // (tip leads the way instead of flying tail-first).
+    this._missileGeo = new THREE.ConeGeometry(0.06, 0.45, 6); this._missileGeo.rotateX(-Math.PI / 2);
+    this._nukeGeo = new THREE.ConeGeometry(0.1, 0.65, 6); this._nukeGeo.rotateX(-Math.PI / 2);
+    this._flashGeo = new THREE.SphereGeometry(0.08, 8, 6);
+    // flat ring for the shockwave part of an impact explosion — lies in its
+    // local XY plane (normal = local +Z) by default, see _spawnFx's `normal` opt
+    this._ringGeo = new THREE.RingGeometry(0.6, 1, 20);
+    this._fx = [];   // transient impact-fx meshes, faded in real time by spin()
+    this._cloudBursts = [];   // sustained nuke-cloud trickle-injections, see _updateCloudBursts
 
     this.group = new THREE.Group();
     this.scene.add(this.group);
@@ -158,14 +232,16 @@ export class PlanetView {
       shader.uniforms.uSeaLevel  = { value: self._dispSea };
       shader.uniforms.uDetailFreq= { value: 2.2 };
       shader.uniforms.uDetailStr = { value: 0.9 };
+      shader.uniforms.sunDirWorld= { value: SUN_DIR.clone() };
+      shader.uniforms.uCityGate  = { value: 1.0 };   // 1 = gate emissive to night side (city lights), 0 = always-on (lava)
       self._planetUniforms = shader.uniforms;
       shader.vertexShader = shader.vertexShader
-        .replace('#include <common>', '#include <common>\nvarying vec2 vCloudUv;\nvarying vec3 vObjPos;\nvarying mat3 vObjToView;')
+        .replace('#include <common>', '#include <common>\nvarying vec2 vCloudUv;\nvarying vec3 vObjPos;\nvarying mat3 vObjToView;\nvarying vec3 vWorldNormal;')
         .replace('#include <uv_vertex>', '#include <uv_vertex>\n\tvCloudUv = uv;')
-        .replace('#include <begin_vertex>', '#include <begin_vertex>\n\tvObjPos = position;\n\tvObjToView = mat3(modelViewMatrix);');
+        .replace('#include <begin_vertex>', '#include <begin_vertex>\n\tvObjPos = position;\n\tvObjToView = mat3(modelViewMatrix);\n\tvWorldNormal = normalize(mat3(modelMatrix) * normal);');
       shader.fragmentShader = shader.fragmentShader
         .replace('#include <common>',
-          '#include <common>\nuniform sampler2D cloudTex;uniform float cloudShadow;uniform sampler2D heightTex;uniform float uSeaLevel;uniform float uDetailFreq;uniform float uDetailStr;\nvarying vec2 vCloudUv;varying vec3 vObjPos;varying mat3 vObjToView;\n' + NOISE)
+          '#include <common>\nuniform sampler2D cloudTex;uniform float cloudShadow;uniform sampler2D heightTex;uniform float uSeaLevel;uniform float uDetailFreq;uniform float uDetailStr;uniform vec3 sunDirWorld;uniform float uCityGate;\nvarying vec2 vCloudUv;varying vec3 vObjPos;varying mat3 vObjToView;varying vec3 vWorldNormal;\n' + NOISE)
         .replace('#include <map_fragment>',
           '#include <map_fragment>\n\tdiffuseColor.rgb *= 1.0 - smoothstep(0.28, 0.7, texture2D(cloudTex, vCloudUv).a) * cloudShadow;')
         .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>
@@ -179,6 +255,15 @@ export class PlanetView {
             vec3 g = vec3(dFbm(bp+vec3(e,0.0,0.0))-n0, dFbm(bp+vec3(0.0,e,0.0))-n0, dFbm(bp+vec3(0.0,0.0,e))-n0);
             normal = normalize(normal + vObjToView * g * (uDetailStr * mask * land));
           }
+        }`)
+        // city lights only glow on the night side: fade out across the
+        // terminator as the geometric (world-space) normal turns toward the
+        // sun. Lava glow (uCityGate = 0) is left untouched — it's hot, not lit.
+        .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
+        {
+          float sunFacing = dot(normalize(vWorldNormal), sunDirWorld);
+          float night = 1.0 - smoothstep(-0.05, 0.15, sunFacing);
+          totalEmissiveRadiance *= mix(1.0, night, uCityGate);
         }`);
     };
     this.planetMesh.material.needsUpdate = true;
@@ -188,7 +273,7 @@ export class PlanetView {
       transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, side: THREE.BackSide,
       uniforms: {
         glowColor: { value: new THREE.Color(0x66aaff) },
-        sunDir:    { value: new THREE.Vector3(8, 5, 10).normalize() },
+        sunDir:    { value: SUN_DIR.clone() },
         intensity: { value: 0 },
         power:     { value: 4 },
       },
@@ -205,18 +290,710 @@ export class PlanetView {
   // Pick a handful of "founding city" sites on temperate lowland coasts.
   // Deterministic (from the world seed) so they're stable + reproducible from
   // a share link. Cities then nucleate and grow outward from these in the bake.
-  _pickCitySeeds(seaLevel) {
+  // `avoid` (optional) steers new sites clear of every existing — living or
+  // ruined — city, so a post-war reseed lands on fresh ground instead of an
+  // old battlefield; `maxCount` caps how many sites this call contributes.
+  _pickCitySeeds(seaLevel, avoid = null, maxCount = FOUND_CITIES) {
     const { hmap } = this._cache, S = Math.round(Math.sqrt(hmap.length));
-    const rng = makeRng((this._seed | 0) ^ 0x5eed);
+    const rng = makeRng((this._seed | 0) ^ 0x5eed ^ (avoid ? avoid.length * 0x9e3779b1 : 0));
+    const halfS = S / 2;
+    const minSep = 0.2 * S, minSep2 = minSep * minSep;   // clear of any old city's urban/scorch footprint
+    const avoidList = avoid ? avoid.slice() : null;
     const seeds = [];
-    for (let tries = 0; tries < 6000 && seeds.length < 9; tries++) {
+    for (let tries = 0; tries < 6000 && seeds.length < maxCount; tries++) {
       const x = (rng() * S) | 0, y = (rng() * S) | 0;
       const h = hmap[y * S + x], lat = y / (S - 1), poleD = Math.abs(lat - 0.5) * 2;
       // habitable lowland just above the shoreline, away from the poles
       // found cities on coastal lowland (just above the shoreline), off the poles
-      if (h > seaLevel + 0.008 && h < seaLevel + 0.09 && poleD < 0.72) seeds.push({ x, y });
+      if (!(h > seaLevel + 0.008 && h < seaLevel + 0.09 && poleD < 0.72)) continue;
+      if (avoidList && avoidList.some(s => {
+        let dx = Math.abs(x - s.x); if (dx > halfS) dx = S - dx;
+        const dy = y - s.y; return dx*dx + dy*dy < minSep2;
+      })) continue;
+      seeds.push({ x, y });
+      if (avoidList) avoidList.push({ x, y });   // also keep this batch spread out from itself
     }
     return seeds;
+  }
+
+  // One faction per founding city — distinct hue (spread evenly around the
+  // wheel) and a generated name, so each settlement is trackable as a
+  // separate entity. Strength is filled in later by _updateBuildings, as
+  // settlements grow. War state (health/target/weapon stage) starts idle
+  // here and is driven each tick by _updateWars once tech allows it.
+  _makeFactions(seeds) {
+    const rng = makeRng((this._seed | 0) ^ 0xfac710);
+    const A = ['Val','Kor','Mira','Sol','Ar','Bel','Dun','Esh','Fen','Gor','Hal','Iri','Jor','Kael','Lor','Mor','Nyx','Pyr','Rho','Sav','Tor','Ul','Vex','Wyn','Xan','Yor','Zeph'];
+    const B = ['dor','ath','en','ica','heim','grad','port','wick','helm','mar','via','stan','thorpe','burg','ford','holm','ren','tu','sk','nor'];
+    return seeds.map((seed, i) => {
+      const hue = ((i / Math.max(1, seeds.length)) + rng() * 0.09) % 1;
+      return {
+        id: i,
+        name: A[(rng() * A.length) | 0] + B[(rng() * B.length) | 0],
+        color: new THREE.Color().setHSL(hue, 0.55, 0.56),
+        strength: 0,    // 0..1, set each frame from revealed building count
+        health: WAR_MAX_HEALTH,
+        defeated: false,
+        targetId: null, // index into this.factions of the nearest living rival
+        warStage: 1,    // 1=tanks, 2=missiles, 3=nukes — only ever advances
+        warTicksAtStage: 0,
+        unit: null,     // in-flight tank/missile/nuke mesh + travel state, or null between launches
+        cooldown: 0,    // Myr remaining before the next unit launches
+        shieldMyr: 0,        // Myr of remaining damage immunity (player-triggered)
+        shieldCooldown: 0,   // Myr before shield can be activated again
+        techCooldown: 0,     // Myr before tech-rush can be used again
+      };
+    });
+  }
+
+  // Lay a road network once founding settlements exist: a minimum-spanning
+  // tree of trunk roads links every city (so they're all connected without
+  // redundant criss-crossing edges), plus a couple of rural spurs running
+  // out from each settlement into open countryside. Every path is pulled
+  // toward local low ground as it's drawn, so roads read as following
+  // valleys rather than rulers. Returns a Float32Array coverage mask
+  // (0..1), painted once and reused by the diffuse recolor in surface.js.
+  _buildRoads(seeds, seaLevel) {
+    const { hmap } = this._cache, S = Math.round(Math.sqrt(hmap.length));
+    const mask = new Float32Array(S * S);
+    if (!seeds.length) return mask;
+    const halfS = S / 2;
+    const wrapDx = (ax, bx) => { let dx = bx - ax; if (dx > halfS) dx -= S; else if (dx < -halfS) dx += S; return dx; };
+    const hAt = (x, y) => {
+      const xi = (((Math.round(x) % S) + S) % S), yi = Math.max(0, Math.min(S - 1, Math.round(y)));
+      return hmap[yi * S + xi];
+    };
+    // pull a point toward the lowest ground nearby — approximates a
+    // valley-seeking path without a full per-pixel pathfind
+    const snapLow = (x, y, r) => {
+      let bx = x, by = y, bh = hAt(x, y);
+      const step = Math.max(1, r / 2);
+      for (let dy = -r; dy <= r; dy += step) for (let dx = -r; dx <= r; dx += step) {
+        const h = hAt(x + dx, y + dy);
+        if (h < bh) { bh = h; bx = x + dx; by = y + dy; }
+      }
+      return { x: bx, y: by };
+    };
+    // thin antialiased line, wrapping in x
+    const drawLine = (ax, ay, bx, by, width = 1.1) => {
+      const dx = wrapDx(ax, bx), dy = by - ay;
+      const steps = Math.max(1, Math.round(Math.hypot(dx, dy)));
+      for (let s = 0; s <= steps; s++) {
+        const t = s / steps;
+        const px = (((ax + dx * t) % S) + S) % S, py = ay + dy * t;
+        const pxi = Math.round(px), pyi = Math.round(py);
+        for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) {
+          const yy = pyi + oy; if (yy < 0 || yy >= S) continue;
+          const xx = ((pxi + ox) % S + S) % S;
+          const cov = Math.max(0, 1 - Math.hypot(ox, oy) / width);
+          if (cov <= 0) continue;
+          const idx = yy * S + xx;
+          if (cov > mask[idx]) mask[idx] = cov;
+        }
+      }
+    };
+    // a chain of control points along the straight line a→b, each snapped
+    // toward nearby low ground, then connected segment by segment
+    const drawPath = (a, b) => {
+      const dx = wrapDx(a.x, b.x), dy = b.y - a.y;
+      const segs = Math.max(2, Math.round(Math.hypot(dx, dy) / (S * 0.05)));
+      const pts = [{ x: a.x, y: a.y }];
+      for (let i = 1; i < segs; i++) {
+        const t = i / segs;
+        pts.push(snapLow(a.x + dx * t, a.y + dy * t, Math.max(2, S * 0.02)));
+      }
+      pts.push({ x: b.x, y: b.y });
+      for (let i = 1; i < pts.length; i++) drawLine(pts[i-1].x, pts[i-1].y, pts[i].x, pts[i].y);
+    };
+
+    // trunk roads: MST over the settlements (Euclidean, wrap-aware)
+    if (seeds.length > 1) {
+      const inTree = [0], remaining = seeds.map((_, i) => i).filter(i => i !== 0);
+      while (remaining.length) {
+        let bi = -1, bj = -1, bd = Infinity;
+        for (const i of inTree) for (const j of remaining) {
+          const ddx = wrapDx(seeds[i].x, seeds[j].x), ddy = seeds[j].y - seeds[i].y;
+          const d = ddx*ddx + ddy*ddy;
+          if (d < bd) { bd = d; bi = i; bj = j; }
+        }
+        drawPath(seeds[bi], seeds[bj]);
+        inTree.push(bj);
+        remaining.splice(remaining.indexOf(bj), 1);
+      }
+    }
+
+    // rural spurs: a couple of dead-end roads per settlement out into the
+    // countryside, also valley-seeking
+    const rng = makeRng((this._seed | 0) ^ 0xc0ffee);
+    for (const seed of seeds) {
+      const spurs = 1 + ((rng() * 2) | 0);
+      for (let n = 0; n < spurs; n++) {
+        const ang = rng() * Math.PI * 2;
+        const len = (0.10 + rng() * 0.10) * S;
+        const end = snapLow(seed.x + Math.cos(ang) * len, seed.y + Math.sin(ang) * len, Math.max(2, S * 0.02));
+        drawPath(seed, end);
+      }
+    }
+    return mask;
+  }
+
+  // Convert a heightmap pixel to its outward (local/object-space) direction
+  // on the sphere — matches the lat/lon convention already used to pick city
+  // seeds (y=0 north pole) and the actual SphereGeometry UV unwrap.
+  _surfaceDir(x, y, S) {
+    const u = x / S, v = y / (S - 1);
+    const phi = u * Math.PI * 2, theta = v * Math.PI, sinT = Math.sin(theta);
+    return new THREE.Vector3(-Math.cos(phi) * sinT, Math.cos(theta), Math.sin(phi) * sinT);
+  }
+
+  // Inverse of _surfaceDir + a heightmap lookup: given a unit direction,
+  // return the actual terrain radius there. Used to make war units (esp.
+  // tanks) ride the real ground instead of floating at a flat offset.
+  _terrainRadiusAt(dir) {
+    const { hmap } = this._cache, S = Math.round(Math.sqrt(hmap.length));
+    const theta = Math.acos(clamp(dir.y, -1, 1));
+    const sinT = Math.sin(theta);
+    let phi = sinT > 1e-6 ? Math.atan2(dir.z, -dir.x) : 0;
+    if (phi < 0) phi += Math.PI * 2;
+    const xi = (((Math.round((phi / (Math.PI * 2)) * S)) % S) + S) % S;
+    const yi = Math.min(S - 1, Math.max(0, Math.round((theta / Math.PI) * (S - 1))));
+    const h = hmap[yi * S + xi];
+    return RADIUS + h * DISP_SCALE + DISP_BIAS;
+  }
+
+  // Spawn a growing skyline once a settlement electrifies: small cuboid
+  // buildings packed densely around each city seed. Buildings are sorted by
+  // distance from the seed and revealed closest-first as civilization
+  // climbs, so the skyline reads as nucleating outward from the seed
+  // rather than popping in all at once. Meshes are parented to planetMesh
+  // (not group) so they spin with the terrain — see spin().
+  _buildBuildings(seeds, seaLevel) {
+    const { hmap } = this._cache, S = Math.round(Math.sqrt(hmap.length));
+    const baseGrey = new THREE.Color(0x8d8579);
+    const boxGeo = new THREE.BoxGeometry(1, 1, 1);
+    const out = [];
+
+    seeds.forEach((seed, idx) => {
+      const rng = makeRng(((this._seed | 0) ^ 0xb1d9 ^ (seed.x * 7349 + seed.y * 911)) >>> 0);
+      // tight downtown core only — well inside the urban-sprawl texture's
+      // reach (surface.js urbanReach tops out at 0.12*S), so the 3D
+      // buildings read as the dense center of a much larger painted sprawl.
+      // Smaller footprints + more tries packs the core noticeably denser.
+      const reach = 0.03 * S, maxBuildings = 44;
+      const cands = [];
+      for (let tries = 0; tries < 1400 && cands.length < maxBuildings; tries++) {
+        const ang = rng() * Math.PI * 2;
+        const rad = reach * Math.pow(rng(), 2.4);
+        const x = Math.round((((seed.x + Math.cos(ang) * rad) % S) + S) % S);
+        const y = Math.round(seed.y + Math.sin(ang) * rad);
+        if (y < 1 || y > S - 2) continue;
+        const h = hmap[y * S + x];
+        const above = h - seaLevel;
+        if (above < 0.006 || above > 0.30) continue;
+        cands.push({ x, y, h, dist: rad });
+      }
+      cands.sort((a, b) => a.dist - b.dist);
+      const total = cands.length;
+      if (!total) { out.push(null); return; }
+
+      // tint toward the faction's colour so each settlement's skyline is
+      // visually distinct, without losing the concrete/masonry base tone
+      const faction = this.factions?.[idx];
+      const tint = faction ? baseGrey.clone().lerp(faction.color, 0.45) : baseGrey;
+      const buildingMat = new THREE.MeshPhongMaterial({ color: tint, specular: 0x222222, shininess: 8 });
+      const buildings = new THREE.InstancedMesh(boxGeo, buildingMat, total);
+      buildings.count = 0;
+      const m = new THREE.Matrix4(), q = new THREE.Quaternion(), qYaw = new THREE.Quaternion(), s3 = new THREE.Vector3();
+      cands.forEach((c) => {
+        const dir = this._surfaceDir(c.x, c.y, S);
+        const r = RADIUS + c.h * DISP_SCALE + DISP_BIAS;
+        const w = 0.035 + rng() * 0.07, d = 0.035 + rng() * 0.07, hgt = 0.05 + Math.pow(rng(), 1.6) * 0.22;
+        q.setFromUnitVectors(Y_AXIS, dir);
+        qYaw.setFromAxisAngle(Y_AXIS, rng() * Math.PI * 2);
+        q.multiply(qYaw);   // yaw the building around its own up-axis, then tilt onto the surface
+        const pos = dir.clone().multiplyScalar(r + hgt / 2);
+        m.compose(pos, q, s3.set(w, hgt, d));
+        buildings.setMatrixAt(buildings.count++, m);
+      });
+      buildings.instanceMatrix.needsUpdate = true;
+      this.planetMesh.add(buildings);
+      out.push({ buildings, total });
+    });
+    return out;
+  }
+
+  // A translucent blue dome over each city, large enough to bound its
+  // skyline — shown only while that faction's shield power is active (see
+  // shieldFaction()/f.shieldMyr). Parented to planetMesh like the
+  // buildings, so it spins with the terrain instead of needing per-frame
+  // repositioning. Built once per city seed; visibility/opacity toggles
+  // every frame in _updateShieldDomes.
+  _buildShieldDomes(seeds) {
+    const { hmap } = this._cache, S = Math.round(Math.sqrt(hmap.length));
+    const geo = new THREE.SphereGeometry(1.6, 20, 12, 0, Math.PI * 2, 0, Math.PI / 2);
+    return seeds.map(seed => {
+      const dir = this._surfaceDir(seed.x, seed.y, S);
+      const r = this._terrainRadiusAt(dir);
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0x3aa8ff, transparent: true, opacity: 0,
+        side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending,
+      });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.copy(dir.clone().multiplyScalar(r));
+      mesh.quaternion.setFromUnitVectors(Y_AXIS, dir);
+      mesh.visible = false;
+      this.planetMesh.add(mesh);
+      return mesh;
+    });
+  }
+
+  // Per-frame: show/hide each city's shield dome and give it a faint pulse,
+  // fading out as the shield's remaining duration runs low. Independent of
+  // war being underway — a shield banked before war starts should still be
+  // visible the instant it's activated.
+  _updateShieldDomes() {
+    if (!this._shieldMeshes || !this.factions) return;
+    const t = performance.now();
+    for (let i = 0; i < this._shieldMeshes.length; i++) {
+      const mesh = this._shieldMeshes[i], f = this.factions[i];
+      const on = f && !f.defeated && f.shieldMyr > 0;
+      mesh.visible = on;
+      if (on) {
+        const frac = Math.min(1, f.shieldMyr / SHIELD_DURATION_MYR);
+        mesh.material.opacity = 0.14 + 0.10 * frac + 0.04 * Math.sin(t * 0.005);
+      }
+    }
+  }
+
+  // Per-frame: grow the visible building count outward from each seed as
+  // civilization climbs (matches the urban-core reveal in surface.js),
+  // refresh each faction's strength reading, and — once war is underway —
+  // let war damage knock the skyline back down (the farthest-out, most
+  // recently-built instances disappear first, since `cands` is sorted
+  // nearest-first). Scorched ground is painted into the actual surface
+  // texture instead (see applyState's scorchVec / surface.js's `scorch`
+  // composite step) so war damage marks the terrain itself, not a decal.
+  _updateBuildings(s) {
+    if (!this._buildingSeeds) return;
+    const stage = smooth(0.4, 0.9, s.civilization);
+    this._buildingSeeds.forEach((e, idx) => {
+      const faction = this.factions?.[idx];
+      if (!e) { if (faction) faction.strength = 0; return; }
+      const healthFrac = faction ? faction.health / WAR_MAX_HEALTH : 1;
+      e.buildings.count = Math.round(e.total * stage * healthFrac);
+      if (faction) faction.strength = e.total ? e.buildings.count / e.total : 0;
+    });
+  }
+
+  // Per-frame: run the war between founding cities, once tech allows it.
+  // Every living faction always targets its nearest living rival (recomputed
+  // here every call — O(n²) over at most 9 factions, trivial). Each
+  // attacker's weapon stage only ever advances with elapsed war-time
+  // (military tech, independent of any one fight, so it never resets when a
+  // target dies and a faction moves on to its next-nearest rival). Damage
+  // is no longer an abstract rate: each faction dispatches one physical
+  // unit at a time (see _launchUnit/_positionUnit below) that travels from
+  // its city to the target's and delivers its damage on arrival. Healing
+  // still applies continuously. All of it ticks on sim-time (s.age), not
+  // wall-clock frames.
+  _updateWars(s) {
+    if (!this.factions || !this._citySeeds) return;
+    const dtMyr = this._lastWarAge == null ? 0 : Math.max(0, s.age - this._lastWarAge);
+    this._lastWarAge = s.age;
+    if (s.civilization < WAR_CIV_THRESHOLD) return;   // no war until tech allows it
+
+    const { hmap } = this._cache, S = Math.round(Math.sqrt(hmap.length)), halfS = S / 2;
+    const wrapDx = (ax, bx) => { let dx = bx - ax; if (dx > halfS) dx -= S; else if (dx < -halfS) dx += S; return dx; };
+    const dist2 = (a, b) => { const dx = wrapDx(a.x, b.x), dy = b.y - a.y; return dx*dx + dy*dy; };
+    const seeds = this._citySeeds, factions = this.factions;
+
+    // retarget: nearest living rival, every tick (cheap, and instantly
+    // reassigns anyone whose target was just defeated). If a faction's
+    // target changes mid-flight (its old target died), abort the unit
+    // already en route to it — it has nowhere left to go. `passive`
+    // factions are colonies founded by an outright war victor (see
+    // _maybeReseedVictor) — they belong to the same side as everyone else
+    // still standing, so they never fight and are never targeted.
+    factions.forEach((f, i) => {
+      if (f.defeated || f.passive) { f.targetId = null; return; }
+      let best = -1, bd = Infinity;
+      factions.forEach((g, j) => {
+        if (j === i || g.defeated || g.passive) return;
+        const d = dist2(seeds[i], seeds[j]);
+        if (d < bd) { bd = d; best = j; }
+      });
+      const newTarget = best === -1 ? null : best;
+      if (f.unit && f.targetId !== newTarget) this._killUnit(f, false);
+      f.targetId = newTarget;
+    });
+
+    if (dtMyr <= 0) return;
+
+    // weapon tech only ever advances, independent of the current fight
+    for (const f of factions) {
+      if (f.defeated || f.passive || f.warStage >= 3) continue;
+      f.warTicksAtStage += dtMyr;
+      if (f.warTicksAtStage >= WAR_STAGE_MYR[f.warStage]) { f.warStage++; f.warTicksAtStage = 0; }
+    }
+
+    // player powers: count down shield duration + both abilities' cooldowns
+    for (const f of factions) {
+      if (f.shieldMyr > 0) f.shieldMyr = Math.max(0, f.shieldMyr - dtMyr);
+      if (f.shieldCooldown > 0) f.shieldCooldown = Math.max(0, f.shieldCooldown - dtMyr);
+      if (f.techCooldown > 0) f.techCooldown = Math.max(0, f.techCooldown - dtMyr);
+    }
+
+    // passive heal first, so a kill landing this same tick can't be
+    // undone by that tick's own regen
+    for (const f of factions) {
+      if (!f.defeated) f.health = Math.min(WAR_MAX_HEALTH, f.health + WAR_HEAL_RATE * dtMyr);
+    }
+
+    // dispatch / advance each faction's single outbound unit
+    for (let i = 0; i < factions.length; i++) {
+      const f = factions[i];
+      if (f.defeated || f.targetId == null) { if (f.unit) this._killUnit(f, false); continue; }
+      const target = factions[f.targetId];
+
+      if (!f.unit) {
+        f.cooldown = Math.max(0, f.cooldown - dtMyr);
+        if (f.cooldown <= 0) this._launchUnit(f, i, f.targetId, seeds, S);
+        continue;
+      }
+
+      const u = f.unit;
+      u.traveled += dtMyr;
+      if (u.kind === 'tank') {
+        // the defender shoots back at inbound tanks; a weakened defender
+        // puts up proportionally less flak, so tanks get through more
+        // often the closer the target already is to falling
+        u.hp -= TANK_DEFENSE * (target.health / WAR_MAX_HEALTH) * dtMyr;
+        if (u.hp <= 0) { this._killUnit(f, true); f.cooldown = UNIT_COOLDOWN_MYR.tank; continue; }
+      }
+      if (u.traveled >= u.travelMyr) {
+        if (target.shieldMyr <= 0) target.health = Math.max(0, target.health - UNIT_DAMAGE[u.kind]);
+        const color = u.kind === 'nuke' ? 0xff5533 : f.color;
+        this._spawnExplosion(u.mesh.position, u.kind, color);
+        if (u.kind === 'nuke') this._spawnMushroomCloud(seeds[u.toIdx], S);
+        f.cooldown = UNIT_COOLDOWN_MYR[u.kind];
+        this._removeUnitMesh(f);
+        if (target.health <= 0) {
+          target.health = 0; target.defeated = true; target.targetId = null;
+          if (target.unit) this._killUnit(target, false);
+        }
+      } else {
+        this._positionUnit(f, seeds, S);
+      }
+    }
+  }
+
+  // Once a war between MULTIPLE founding cities ends with exactly one
+  // faction left standing, that victor expands: a few new colonies are
+  // founded elsewhere on the planet (clear of every existing — living or
+  // ruined — city site, see _pickCitySeeds' `avoid`), painted in the
+  // victor's own colour. They're marked `passive` so _updateWars never lets
+  // them fight or be targeted — there's no one left to start a new war with,
+  // and reseeding shouldn't manufacture one. Runs at most once per world.
+  _maybeReseedVictor(seaLevel) {
+    if (this._reseeded || !this.factions || this.factions.length < 2) return;
+    const living = this.factions.filter(f => f && !f.defeated && !f.passive);
+    if (living.length !== 1) return;
+    this._reseeded = true;
+
+    const newCount = Math.min(RESEED_NEW_CITIES, MAX_CITIES - this._citySeeds.length);
+    if (newCount <= 0) return;
+    const newSeeds = this._pickCitySeeds(seaLevel, this._citySeeds, newCount);
+    if (!newSeeds.length) return;
+
+    const winner = living[0];
+    this._citySeeds = this._citySeeds.concat(newSeeds);
+    for (let k = 0; k < newSeeds.length; k++) {
+      this.factions.push({
+        id: this.factions.length,
+        name: winner.name,
+        color: winner.color.clone(),
+        strength: 0,
+        health: WAR_MAX_HEALTH,
+        defeated: false,
+        passive: true,      // belongs to the victor outright — see _updateWars
+        targetId: null,
+        warStage: winner.warStage,
+        warTicksAtStage: 0,
+        unit: null,
+        cooldown: 0,
+        shieldMyr: 0,
+        shieldCooldown: 0,
+        techCooldown: 0,
+      });
+    }
+
+    // rebuild roads/buildings/domes over the full, now-larger city list —
+    // a one-time cost paid once per world, same as the original founding
+    this._roadMask = this._buildRoads(this._citySeeds, seaLevel);
+    this._disposeCityProps();
+    this._buildingSeeds = this._buildBuildings(this._citySeeds, seaLevel);
+    this._shieldMeshes = this._buildShieldDomes(this._citySeeds);
+    this._last = null;   // force a full recolor — new urban footprint to paint
+  }
+
+  // Remove + dispose the InstancedMesh buildings and shield-dome meshes
+  // built by _buildBuildings/_buildShieldDomes, ahead of rebuilding them
+  // (each call creates its own fresh shared geometry — see those methods).
+  _disposeCityProps() {
+    if (this._buildingSeeds) {
+      let geo = null;
+      for (const e of this._buildingSeeds) {
+        if (!e) continue;
+        this.planetMesh.remove(e.buildings);
+        e.buildings.material.dispose();
+        geo = e.buildings.geometry;
+      }
+      geo?.dispose();
+    }
+    if (this._shieldMeshes?.length) {
+      for (const mesh of this._shieldMeshes) {
+        this.planetMesh.remove(mesh);
+        mesh.material.dispose();
+      }
+      this._shieldMeshes[0].geometry.dispose();
+    }
+  }
+
+  // Tracks how long the biosphere has been completely gone while cities
+  // still stand, and wipes them once that's gone on "for some time" (see
+  // BIO_GONE_WIPE_MYR) rather than on a single bad tick — a transient dip
+  // (e.g. a passing impact) shouldn't erase a civilization outright. Ticks
+  // independently of _updateWars/_maybeReseedVictor so it still runs (and
+  // can still wipe) even before war or post-war colonies ever come up.
+  _maybeWipeCivilization(s) {
+    if (!this._citySeeds) { this._lastBioAge = null; this._bioGoneMyr = 0; return; }
+    const dtMyr = this._lastBioAge == null ? 0 : Math.max(0, s.age - this._lastBioAge);
+    this._lastBioAge = s.age;
+    if (s.biosphere >= BIO_GONE_THRESHOLD) { this._bioGoneMyr = 0; return; }
+    this._bioGoneMyr += dtMyr;
+    if (this._bioGoneMyr >= BIO_GONE_WIPE_MYR) this._wipeCivilization();
+  }
+
+  // Erase every city/faction/road/building/shield/unit — the planet reverts
+  // to bare terrain, exactly as if civilization had never industrialized.
+  // The founding check in applyState (civilization > 0.01 && !this._citySeeds)
+  // then refounds a fresh set of cities/factions on its own once biosphere
+  // recovers enough for civilization to climb again, so the war cycle repeats.
+  _wipeCivilization() {
+    if (this.factions) for (const f of this.factions) this._killUnit(f, false);
+    this._disposeCityProps();
+    this._citySeeds = null;
+    this._roadMask = null;
+    this._buildingSeeds = null;
+    this._shieldMeshes = null;
+    this.factions = null;
+    this._reseeded = false;
+    this._lastWarAge = null;
+    this._bioGoneMyr = 0;
+    this._last = null;   // force a full recolor — wipe the urban footprint off the surface
+  }
+
+  // Player powers, both triggered from the in-world hover UI over a city
+  // (see main.js). Shield grants a living faction temporary full immunity to
+  // incoming unit damage (see the `target.shieldMyr` check above); tech-rush
+  // instantly advances its weapon stage instead of waiting out WAR_STAGE_MYR.
+  // Each reports whether it actually fired, so the UI can tell a no-op click
+  // from a real one.
+  shieldFaction(id) {
+    const f = this.factions?.[id];
+    if (!f || f.defeated || f.shieldCooldown > 0) return false;
+    f.shieldMyr = SHIELD_DURATION_MYR;
+    f.shieldCooldown = SHIELD_COOLDOWN_MYR;
+    return true;
+  }
+
+  rushTech(id) {
+    const f = this.factions?.[id];
+    if (!f || f.defeated || f.techCooldown > 0 || f.warStage >= 3) return false;
+    f.warStage++;
+    f.warTicksAtStage = 0;
+    f.techCooldown = TECH_RUSH_COOLDOWN_MYR;
+    return true;
+  }
+
+  // Each living city's current world-space position + outward normal
+  // (accounting for the planet's ongoing spin), for main.js to project to
+  // screen space and decide which city the mouse is hovering near. Normal
+  // lets the caller cull cities currently spun around to the far side.
+  getCityWorldPositions() {
+    if (!this._citySeeds) return [];
+    const S = Math.round(Math.sqrt(this._cache.hmap.length));
+    this.planetMesh.updateMatrixWorld();
+    return this._citySeeds.map(seed => {
+      const dir = this._surfaceDir(seed.x, seed.y, S);
+      const r = this._terrainRadiusAt(dir);
+      const pos = dir.clone().multiplyScalar(r).applyMatrix4(this.planetMesh.matrixWorld);
+      const normal = dir.clone().transformDirection(this.planetMesh.matrixWorld);
+      return { pos, normal };
+    });
+  }
+
+  // Launch a fresh unit (tank/missile/nuke per the attacker's current
+  // warStage) from faction `f`'s city toward `toIdx`'s city. Tanks travel at
+  // a constant speed, so their duration scales with the actual great-circle
+  // distance; missiles/nukes keep a flat travel time (they're fast enough
+  // that distance doesn't read as strongly either way).
+  _launchUnit(f, fromIdx, toIdx, seeds, S) {
+    const kind = STAGE_KIND[f.warStage];
+    const mat = new THREE.MeshBasicMaterial({ color: kind === 'nuke' ? 0xff5533 : f.color });
+    let mesh, travelMyr;
+    if (kind === 'tank') {
+      const a = this._surfaceDir(seeds[fromIdx].x, seeds[fromIdx].y, S);
+      const b = this._surfaceDir(seeds[toIdx].x, seeds[toIdx].y, S);
+      travelMyr = Math.max(TANK_MIN_TRAVEL_MYR, a.angleTo(b) / TANK_SPEED);
+      mesh = this._buildTankFormation(mat);
+    } else {
+      travelMyr = UNIT_TRAVEL_MYR[kind];
+      mesh = new THREE.Mesh(kind === 'missile' ? this._missileGeo : this._nukeGeo, mat);
+    }
+    this.planetMesh.add(mesh);
+    f.unit = { kind, mesh, material: mat, traveled: 0, travelMyr, hp: kind === 'tank' ? TANK_HP : Infinity, fromIdx, toIdx };
+    this._positionUnit(f, seeds, S);
+  }
+
+  // A tank "unit" is a loose, fanned-out cluster of small cubes (sharing one
+  // geometry + one material) rather than a single box — reads as a scattered
+  // formation, not a blob.
+  _buildTankFormation(mat) {
+    const group = new THREE.Group();
+    const offsets = [
+      [0, 0.015, 0.3], [-0.28, -0.01, 0.1], [0.3, 0.02, 0.04],
+      [-0.2, 0, -0.26], [0.24, -0.015, -0.22], [0.02, 0.01, -0.4],
+    ];
+    offsets.forEach(([x, y, z]) => {
+      const cube = new THREE.Mesh(this._tankGeo, mat);
+      cube.position.set(x, y, z);
+      group.add(cube);
+    });
+    return group;
+  }
+
+  // Place + orient an in-flight unit along the great-circle path between its
+  // origin and target cities. The base radius follows the real terrain
+  // height underneath (via _terrainRadiusAt) plus a small clearance, so
+  // tanks actually climb and dip with the ground instead of floating at a
+  // flat offset; missiles/nukes add a shallow arc on top of that same
+  // ground-following base so they still clear hills along the way.
+  _positionUnit(f, seeds, S) {
+    const u = f.unit;
+    const a = this._surfaceDir(seeds[u.fromIdx].x, seeds[u.fromIdx].y, S);
+    const b = this._surfaceDir(seeds[u.toIdx].x, seeds[u.toIdx].y, S);
+    const clearance = u.kind === 'tank' ? 0.03 : 0.05;
+    const arcPeak = u.kind === 'tank' ? 0 : (u.kind === 'nuke' ? 1.5 : 1.0);
+    const at = (t) => {
+      const dir = a.clone().lerp(b, clamp(t, 0, 1)).normalize();
+      const r = this._terrainRadiusAt(dir) + clearance + arcPeak * Math.sin(clamp(t, 0, 1) * Math.PI);
+      return { dir, pos: dir.clone().multiplyScalar(r) };
+    };
+    const t = u.traveled / u.travelMyr;
+    const here = at(t), ahead = at(t + 0.01);
+    u.mesh.position.copy(here.pos);
+    u.mesh.up.copy(here.dir);
+    u.mesh.lookAt(ahead.pos);
+  }
+
+  // Remove a unit, optionally with a small "destroyed in transit" puff
+  // (tanks shot down by the defender before arriving — see _updateWars).
+  _killUnit(f, destroyedInCombat) {
+    if (!f.unit) return;
+    if (destroyedInCombat) this._spawnFlash(f.unit.mesh.position, 0x888888, 0.22);
+    this._removeUnitMesh(f);
+  }
+
+  _removeUnitMesh(f) {
+    if (!f.unit) return;
+    this.planetMesh.remove(f.unit.mesh);
+    f.unit.material.dispose();   // single shared material — tank formations share one across all their cubes
+    f.unit = null;
+  }
+
+  // Generic transient FX mesh: grows by `growth`x and fades to 0 opacity over
+  // `life` seconds (real time, decoupled from sim-speed so it always reads as
+  // a snappy burst). `normal`, if given, orients a flat geometry (e.g. the
+  // shockwave ring, which lies in its local XY plane) so it hugs the surface
+  // at `pos` instead of facing a fixed world direction.
+  _spawnFx(geo, pos, color, { scale = 1, life = 0.45, growth = 2.2, opacity = 0.9, additive = true, normal = null } = {}) {
+    const mat = new THREE.MeshBasicMaterial({
+      color, transparent: true, opacity, depthWrite: false, side: THREE.DoubleSide,
+      blending: additive ? THREE.AdditiveBlending : THREE.NormalBlending,
+    });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.copy(pos);
+    if (normal) mesh.quaternion.setFromUnitVectors(Z_AXIS, normal);
+    mesh.scale.setScalar(scale);
+    this.planetMesh.add(mesh);
+    this._fx.push({ mesh, life, maxLife: life, baseScale: scale, growth, maxOpacity: opacity });
+  }
+
+  // Quick additive flash — kept as a thin wrapper since a couple of call
+  // sites (e.g. a tank shot down in transit) just want a single small puff.
+  _spawnFlash(pos, color, scale) {
+    this._spawnFx(this._flashGeo, pos, color, { scale, life: 0.45, growth: 2.2, opacity: 0.9 });
+  }
+
+  // Fuller impact explosion: a white-hot core, a colored burst, and an
+  // expanding shockwave ring hugging the terrain; nukes additionally get a
+  // dark, slow-fading smoke puff (separate from the atmospheric mushroom
+  // cloud spawned into the fluid sim — see _spawnMushroomCloud).
+  _spawnExplosion(pos, kind, color) {
+    const dir = pos.clone().normalize();
+    const big = kind === 'nuke' ? 1.6 : kind === 'missile' ? 1.0 : 0.7;
+    this._spawnFx(this._flashGeo, pos, 0xfff4d0, { scale: 0.4 * big, life: 0.22, growth: 1.6, opacity: 1 });
+    this._spawnFx(this._flashGeo, pos, color, { scale: 0.55 * big, life: 0.5, growth: 2.4, opacity: 0.85 });
+    this._spawnFx(this._ringGeo, pos, color, { scale: 0.3 * big, life: 0.6, growth: 5, opacity: 0.6, normal: dir });
+    if (kind === 'nuke') {
+      this._spawnFx(this._flashGeo, pos, 0x554a40, { scale: 0.5 * big, life: 1.6, growth: 3.2, opacity: 0.55, additive: false });
+    }
+  }
+
+  // Inject density into the live cloud fluid sim at the impact site so a
+  // nuke leaves a real, drifting cloud instead of just a local particle
+  // effect. The sim's ambient dissipation decays density exponentially each
+  // tick, so a single one-shot burst would flash and vanish almost
+  // immediately regardless of how much mass we inject — instead we queue a
+  // sustained trickle (see _updateCloudBursts) that keeps topping up the
+  // same spot for several seconds, fading out as it goes.
+  _spawnMushroomCloud(seed, S) {
+    if (!this.clouds) return;
+    this.clouds.spawnBurst(seed.x / S, seed.y / S, 2.2, 3);
+    this._cloudBursts.push({ u: seed.x / S, v: seed.y / S, life: 7, maxLife: 7 });
+  }
+
+  // Real-time (not sim-speed-scaled) top-up of nuke clouds queued by
+  // _spawnMushroomCloud — keeps re-injecting a shrinking trickle of density
+  // at each burst site so the cloud lingers and fades gradually instead of
+  // the ambient dissipation eating a single injection within a second.
+  _updateCloudBursts(dt) {
+    if (!this._cloudBursts.length || !this.clouds) return;
+    const RATE = 0.85;
+    for (let i = this._cloudBursts.length - 1; i >= 0; i--) {
+      const b = this._cloudBursts[i];
+      const amt = RATE * (b.life / b.maxLife) * dt;
+      this.clouds.spawnBurst(b.u, b.v, amt, 3);
+      b.life -= dt;
+      if (b.life <= 0) this._cloudBursts.splice(i, 1);
+    }
+  }
+
+  _updateWarFx(dt) {
+    if (!this._fx.length) return;
+    for (let i = this._fx.length - 1; i >= 0; i--) {
+      const fx = this._fx[i];
+      fx.life -= dt;
+      const k = Math.max(0, fx.life / fx.maxLife);
+      fx.mesh.scale.setScalar(fx.baseScale * (1 + (1 - k) * fx.growth));
+      fx.mesh.material.opacity = k * fx.maxOpacity;
+      if (fx.life <= 0) {
+        this.planetMesh.remove(fx.mesh);
+        fx.mesh.material.dispose();
+        this._fx.splice(i, 1);
+      }
+    }
   }
 
   // Build the cloud obstacle mask: downsample the heightmap to the fluid grid
@@ -259,11 +1036,28 @@ export class PlanetView {
     const seaLevel = this._seaHeightForFraction(s.oceanCoverage);
     const molten = s.molten;
 
+    // extinction: wipe any standing cities/factions once the biosphere has
+    // been gone long enough — runs before the founding check below so a
+    // recovering planet can refound fresh civilizations in the same pass.
+    this._maybeWipeCivilization(s);
+
+    // war damage chars the ground around a city — tracked per faction/seed
+    // (same index as this._citySeeds) and baked into the diffuse/emissive
+    // textures by surface.js's scorch overlay, applied separately from the
+    // structural recolor below (see the scorchChanged-only branch) so combat
+    // hits don't force a full S×S recolor every time.
+    const scorchVec = this.factions
+      ? this.factions.map(f => f ? Math.min(1, Math.max(0, 1 - f.health / WAR_MAX_HEALTH)) : 0)
+      : [];
+
     // ── throttle the expensive recolor ── (snow is now temperature-driven, so
     // track surfaceTemp instead of a snowline)
     const v = { seaLevel, surfaceTemp: s.surfaceTemp, waterMass: s.waterMass, molten,
                 biosphere: s.biosphere, civilization: s.civilization };
     const L = this._last;
+    const LS = this._lastScorch;
+    const scorchChanged = !LS || LS.length !== scorchVec.length ||
+      scorchVec.some((sv, i) => Math.abs(sv - LS[i]) > 0.05);
     const changed = !L ||
       Math.abs(L.seaLevel - seaLevel)            > 0.006 ||
       Math.abs(L.surfaceTemp - s.surfaceTemp)    > 1.5 ||
@@ -275,8 +1069,17 @@ export class PlanetView {
     // founding cities: pick stable seed sites the first time life industrializes,
     // and force an immediate recolor so the city emissive map exists before the
     // glow ramps up (otherwise the bare emissive colour flashes the whole globe).
-    if (s.civilization > 0.01 && !this._citySeeds) {
+    // Also gated on biosphere, not just civilization — civilization decays
+    // slower than biosphere as a world dies off (see _maybeWipeCivilization),
+    // so right after a wipe it can still be transiently > 0.01; without the
+    // biosphere check that re-founds cities in the very same tick they were
+    // wiped, undoing the wipe.
+    if (s.civilization > 0.01 && s.biosphere >= BIO_GONE_THRESHOLD && !this._citySeeds) {
       this._citySeeds = this._pickCitySeeds(seaLevel);
+      this.factions = this._makeFactions(this._citySeeds);
+      this._roadMask = this._buildRoads(this._citySeeds, seaLevel);
+      this._buildingSeeds = this._buildBuildings(this._citySeeds, seaLevel);
+      this._shieldMeshes = this._buildShieldDomes(this._citySeeds);
       this._last = null;
     }
 
@@ -295,20 +1098,41 @@ export class PlanetView {
       }
     }
 
-    if (changed) {
+    if (changed || !this._diffuseCanvas) {
+      // full recolor: structural state moved (sea level, climate, biosphere,
+      // civilization) — redo all three S×S passes, and stash the pre-scorch
+      // pixel data + live canvases so a later scorch-only change (below) can
+      // skip straight to the cheap path.
       const m = this.planetMesh.material;
       const oldMap = m.map, oldEm = m.emissiveMap, oldSp = m.specularMap;
-      const { map, emissiveMap, specularMap } = renderSurfaceTextures(this._cache.hmap, this._cache.himap, {
-        type: this._type, hue: this._hue, seaLevel, surfaceTemp: s.surfaceTemp, waterMass: s.waterMass, molten,
-        biosphere: s.biosphere, civilization: s.civilization, citySeeds: this._citySeeds,
-      });
+      const { map, emissiveMap, specularMap, diffuseCanvas, emissiveCanvas, baseDiffuseData, baseEmissiveData } =
+        renderSurfaceTextures(this._cache.hmap, this._cache.himap, {
+          type: this._type, hue: this._hue, seaLevel, surfaceTemp: s.surfaceTemp, waterMass: s.waterMass, molten,
+          biosphere: s.biosphere, civilization: s.civilization, citySeeds: this._citySeeds,
+          roadMask: this._roadMask, scorch: scorchVec,
+        });
       m.map = map;   // normalMap is static (set once in build) — never re-touched here
       m.emissiveMap = emissiveMap || null;
       m.specularMap = specularMap || null;
       m.shininess = specularMap ? 60 : this._baseShininess;
       m.needsUpdate = true;
       oldMap?.dispose(); oldEm?.dispose(); oldSp?.dispose();
+      this._diffuseCanvas = diffuseCanvas; this._emissiveCanvas = emissiveCanvas;
+      this._baseDiffuseData = baseDiffuseData; this._baseEmissiveData = baseEmissiveData;
       this._last = v;
+      this._lastScorch = scorchVec;
+    } else if (scorchChanged) {
+      // war damage only: repaint just the scorched cities' footprints from
+      // the cached pre-scorch pixels — no S×S recompute, no per-pixel
+      // nearest-city search. Same canvases/textures, just new pixels + a
+      // GPU re-upload (needsUpdate), so this is cheap enough to run on
+      // every combat tick during a sustained war.
+      const m = this.planetMesh.material;
+      repaintScorch(this._diffuseCanvas, this._emissiveCanvas, this._baseDiffuseData, this._baseEmissiveData,
+        this._cache.hmap, { seaLevel, civilization: s.civilization, molten, citySeeds: this._citySeeds, scorch: scorchVec });
+      m.map.needsUpdate = true;
+      if (m.emissiveMap) m.emissiveMap.needsUpdate = true;
+      this._lastScorch = scorchVec;
     }
 
     // ── cheap per-frame: glow + city lights ──
@@ -318,7 +1142,12 @@ export class PlanetView {
     const m = this.planetMesh.material;
     m.emissiveIntensity = !m.emissiveMap ? 0
       : molten > 0.01 ? 0.6 + molten * 1.2 + Math.sin(performance.now() * 0.002) * 0.2 * molten
-      : smooth(0.01, 0.3, s.civilization) * (1.0 + Math.sin(performance.now() * 0.0017) * 0.12);
+      : smooth(0.4, 0.9, s.civilization) * (1.0 + Math.sin(performance.now() * 0.0017) * 0.12);
+    if (this._planetUniforms) this._planetUniforms.uCityGate.value = molten > 0.01 ? 0.0 : 1.0;
+    this._updateBuildings(s);
+    this._updateWars(s);
+    this._maybeReseedVictor(seaLevel);
+    this._updateShieldDomes();
 
     // aurorae: capacity = dynamo strength × solar wind × enough air to glow;
     // the Aurora itself decides when to flare (substorms).
@@ -367,6 +1196,8 @@ export class PlanetView {
     this.planetMesh.rotation.y += dt * PLANET_SPIN;
     this.clouds.update(dt);
     if (this.aurora) this.aurora.update(dt);
+    this._updateWarFx(dt);
+    this._updateCloudBursts(dt);
   }
 
   dispose() {

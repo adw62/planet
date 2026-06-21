@@ -215,7 +215,8 @@ export function classify(s) {
   if (T > 330 && s.oceanCoverage < 0.05 && s.co2 > 3)      return 'Venusian — runaway greenhouse';
   if (s.iceCoverage > 0.75)                                return 'Snowball';
   if (s.atmosphere < 0.7 && T < 265)                       return 'Martian — frozen & airless';
-  if (s.civilization > 0.35)                               return 'Inhabited — technological';
+  if (s.civilization > 0.4)                                return 'Inhabited — technological';
+  if (s.civilization > 0.01)                               return 'Inhabited — agrarian';
   if (s.biosphere > 0.4)                                   return 'Living world';
   if (s.habitability > 0.45)                               return 'Temperate — habitable';
   if (s.oceanCoverage > 0.6)                               return 'Ocean world';
