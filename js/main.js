@@ -288,6 +288,7 @@ function updateDash() {
   bar('st-temp',  (sim.surfaceTemp-180)/(520-180)*100, tempColor(sim.surfaceTemp), Math.round(sim.surfaceTemp)+' K');
   bar('st-ocean', sim.oceanCoverage*100, '#3a86c8', Math.round(sim.oceanCoverage*100)+'%');
   bar('st-ice',   sim.iceCoverage*100, '#bfe0ff', Math.round(sim.iceCoverage*100)+'%');
+  bar('st-dust',  sim.dust*100, '#948b7a', Math.round(sim.dust*100)+'%');
   updateAtmosphere();
   bar('st-mag',   sim.magneticField*100, '#a8f', Math.round(sim.magneticField*100)+'%');
   bar('st-hab',   sim.habitability*100, '#6e6', Math.round(sim.habitability*100)+'%');

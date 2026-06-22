@@ -45,7 +45,12 @@ const WAR_STAGE_MYR = [0, 150, 60]; // Myr spent at stage N before advancing to 
 const STAGE_KIND = [null, 'tank', 'missile', 'nuke'];
 const UNIT_TRAVEL_MYR   = { missile: 5,   nuke: 6 };   // tanks travel at a constant speed instead — see TANK_SPEED
 const UNIT_DAMAGE       = { tank: 10,  missile: 14,  nuke: 65 };
-const UNIT_COOLDOWN_MYR = { tank: 3,   missile: 6,   nuke: 10 };
+const UNIT_COOLDOWN_MYR = { tank: 3,   missile: 6,   nuke: 18 };
+// A single warhead should read as "a real, brief cold snap" not "extinction
+// event" — it's a sustained multi-nuke war that should be able to stack this
+// into a true nuclear winter (see sim.js's K.dustDecay for how fast it clears
+// between strikes).
+const NUKE_DUST = 0.18;
 const TANK_HP = 16;          // a tank destroyed mid-transit deals zero damage
 const TANK_DEFENSE = 0.55;   // HP/Myr a *full-health* defender does to an inbound tank (scales down as it takes damage) — kept in proportion with TANK_SPEED below
 const TANK_SPEED = 0.02;     // rad/Myr of great-circle travel — constant, so far trips take proportionally longer
@@ -92,6 +97,7 @@ const _GAS_COL = {
 const _TOXIC = new THREE.Color(0x66cc22);
 const _CLOUD_WHITE  = new THREE.Color(1, 1, 1);
 const _CLOUD_SULFUR = new THREE.Color(0.90, 0.78, 0.52);
+const _CLOUD_ASH    = new THREE.Color(0.20, 0.18, 0.17);   // nuclear-winter dust cloud tint
 
 // Fresnel limb-glow shader for the atmosphere halo. Brightest where the
 // view ray grazes the sphere's edge (the limb), brighter still on the
@@ -169,6 +175,7 @@ export class PlanetView {
     // (tip leads the way instead of flying tail-first).
     this._missileGeo = new THREE.ConeGeometry(0.06, 0.45, 6); this._missileGeo.rotateX(-Math.PI / 2);
     this._nukeGeo = new THREE.ConeGeometry(0.1, 0.65, 6); this._nukeGeo.rotateX(-Math.PI / 2);
+    this._unitLookMat = new THREE.Matrix4();   // scratch — see _positionUnit
     this._flashGeo = new THREE.SphereGeometry(0.08, 8, 6);
     // flat ring for the shockwave part of an impact explosion — lies in its
     // local XY plane (normal = local +Z) by default, see _spawnFx's `normal` opt
@@ -600,7 +607,12 @@ export class PlanetView {
     if (!this.factions || !this._citySeeds) return;
     const dtMyr = this._lastWarAge == null ? 0 : Math.max(0, s.age - this._lastWarAge);
     this._lastWarAge = s.age;
-    if (s.civilization < WAR_CIV_THRESHOLD) return;   // no war until tech allows it
+    // Below the threshold, no NEW fighting starts (weapon tech freezes, no
+    // fresh launches) — but a unit already in flight from an earlier,
+    // higher-civilization tick must keep flying rather than freezing
+    // mid-air: a transient habitability/civilization dip (e.g. a nuke's own
+    // dust knocking civilization down) shouldn't leave missiles paused.
+    const warAllowed = s.civilization >= WAR_CIV_THRESHOLD;
 
     const { hmap } = this._cache, S = Math.round(Math.sqrt(hmap.length)), halfS = S / 2;
     const wrapDx = (ax, bx) => { let dx = bx - ax; if (dx > halfS) dx -= S; else if (dx < -halfS) dx += S; return dx; };
@@ -629,11 +641,14 @@ export class PlanetView {
 
     if (dtMyr <= 0) return;
 
-    // weapon tech only ever advances, independent of the current fight
-    for (const f of factions) {
-      if (f.defeated || f.passive || f.warStage >= 3) continue;
-      f.warTicksAtStage += dtMyr;
-      if (f.warTicksAtStage >= WAR_STAGE_MYR[f.warStage]) { f.warStage++; f.warTicksAtStage = 0; }
+    // weapon tech only ever advances, independent of the current fight —
+    // but only while war is actually allowed (see warAllowed above)
+    if (warAllowed) {
+      for (const f of factions) {
+        if (f.defeated || f.passive || f.warStage >= 3) continue;
+        f.warTicksAtStage += dtMyr;
+        if (f.warTicksAtStage >= WAR_STAGE_MYR[f.warStage]) { f.warStage++; f.warTicksAtStage = 0; }
+      }
     }
 
     // player powers: count down shield duration + both abilities' cooldowns
@@ -657,7 +672,7 @@ export class PlanetView {
 
       if (!f.unit) {
         f.cooldown = Math.max(0, f.cooldown - dtMyr);
-        if (f.cooldown <= 0) this._launchUnit(f, i, f.targetId, seeds, S);
+        if (warAllowed && f.cooldown <= 0) this._launchUnit(f, i, f.targetId, seeds, S);
         continue;
       }
 
@@ -674,7 +689,10 @@ export class PlanetView {
         if (target.shieldMyr <= 0) target.health = Math.max(0, target.health - UNIT_DAMAGE[u.kind]);
         const color = u.kind === 'nuke' ? 0xff5533 : f.color;
         this._spawnExplosion(u.mesh.position, u.kind, color);
-        if (u.kind === 'nuke') this._spawnMushroomCloud(seeds[u.toIdx], S);
+        if (u.kind === 'nuke') {
+          this._spawnMushroomCloud(seeds[u.toIdx], S);
+          s.dust = clamp(s.dust + NUKE_DUST, 0, 1);
+        }
         f.cooldown = UNIT_COOLDOWN_MYR[u.kind];
         this._removeUnitMesh(f);
         if (target.health <= 0) {
@@ -893,8 +911,15 @@ export class PlanetView {
     const t = u.traveled / u.travelMyr;
     const here = at(t), ahead = at(t + 0.01);
     u.mesh.position.copy(here.pos);
-    u.mesh.up.copy(here.dir);
-    u.mesh.lookAt(ahead.pos);
+    // Object3D.lookAt() treats its argument as a WORLD-space point on any
+    // object with a parent (it reads the mesh's true world position
+    // internally) — but here.pos/ahead.pos are in planetMesh's LOCAL space,
+    // so calling u.mesh.lookAt(ahead.pos) mixed local and world frames and
+    // the resulting heading drifted further off the real flight path the
+    // more the planet had spun. Build the look rotation directly in local
+    // space instead, so it tracks the actual ballistic arc tangent.
+    this._unitLookMat.lookAt(here.pos, ahead.pos, here.dir);
+    u.mesh.quaternion.setFromRotationMatrix(this._unitLookMat);
   }
 
   // Remove a unit, optionally with a small "destroyed in transit" puff
@@ -1182,9 +1207,11 @@ export class PlanetView {
     const air = smooth(0.05, 0.9, comp.total);   // 0 at vacuum → 1 once there's real air
     const humidity = clamp(s.oceanCoverage * 0.95 + s.waterVapor * 1.3, 0, 1);
     const sulfur   = clamp(smooth(2.5, 8, s.co2), 0, 0.95);
-    const cover    = clamp(Math.max(humidity * 0.95, sulfur) * air, 0, 0.95);
-    const cloudColor = this._type === 'toxic' ? _TOXIC
-      : sulfur > humidity * 0.95 ? _CLOUD_SULFUR : _CLOUD_WHITE;
+    const cover    = clamp(Math.max(humidity * 0.95, sulfur, s.dust * 0.9) * air, 0, 0.95);
+    const cloudColor = (this._type === 'toxic' ? _TOXIC
+      : sulfur > humidity * 0.95 ? _CLOUD_SULFUR : _CLOUD_WHITE).clone();
+    // nuclear winter: dust darkens the deck toward ash instead of brightening it
+    if (s.dust > 0.01) cloudColor.lerp(_CLOUD_ASH, clamp(s.dust * 1.2, 0, 0.9));
     // hotter climates drive more energetic weather → faster winds
     const windScale = clamp(0.55 + smooth(230, 400, s.surfaceTemp) * 1.5, 0.55, 2.2);
     this.clouds.setTarget(cover, cloudColor, windScale);

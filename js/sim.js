@@ -28,10 +28,15 @@ export const K = {
   outgas:      0.046,   // CO2 outgassed per unit volcanism per Myr (tectonics → air)
   weather:     0.0042,  // CO2 drawn down per °C-above-freezing per Myr, ×ocean coverage
   escape:      0.105,   // atmospheric escape rate when the magnetic shield is down
-  iceRelax:    0.18,    // how fast ice caps grow/shrink toward target
-  oceanRelax:  0.16,    // how fast shorelines track the liquid-water target
+  iceRelax:    0.06,    // how fast ice caps grow/shrink toward target (slow enough that
+                         // a short-lived dust/temp blip doesn't flicker ice on and off)
+  oceanRelax:  0.06,    // how fast shorelines track the liquid-water target (slowed to
+                         // match iceRelax — keeps a short-lived dust/temp blip from
+                         // making shorelines flicker in and out)
   waterBoil:   0.055,   // water lost to space per Myr when boiling
   cometWater:  0.16,    // ocean inventory added per comet impact
+  dustDecay:   0.05,    // dust/ash settling rate per Myr — lingers for a long while
+  dustBlock:   0.35,    // max fraction of solar flux a maxed-out dust layer blocks — a milder cap
 };
 
 // ── small math helpers ───────────────────────────────────────
@@ -84,6 +89,8 @@ export function createSim() {
     surfaceTemp:   288,     // K
     waterVapor:    0.0,     // 0..1 vapor fraction (greenhouse feedback)
     albedo:        0.30,
+    dust:          0.0,     // 0..1 high-altitude soot/ash blocking sunlight — spikes
+                             // from nukes, decays on its own over a few Myr (nuclear winter)
     iceCoverage:   0.05,    // 0..1 fraction of surface under ice (poles-in)
     oceanCoverage: 0.0,     // 0..1 fraction of surface under liquid water
     atmosphere:    1.55,    // total atmospheric mass (relative)
@@ -156,8 +163,16 @@ export function stepSim(s, dt) {
     0.07, 0.85,
   );
 
+  // 8b. High-altitude dust/ash (nuclear winter). Kept separate from albedo
+  //     above — rather than brightening the planet like ice/cloud do, dust
+  //     ABSORBS incoming sunlight before it reaches the ground, so it's
+  //     modeled as a direct cut to effective solar flux instead. Settles
+  //     out on its own; whatever injects it (e.g. a nuke) just bumps s.dust.
+  s.dust = relax(s.dust, 0, K.dustDecay, dt);
+  const sunBlocked = s.solarFlux * (1 - clamp01(s.dust) * K.dustBlock);
+
   // 9. NEW surface temperature.
-  const T = equilTemp(s.solarFlux, s.albedo) + greenhouse(s.co2, s.waterVapor);
+  const T = equilTemp(sunBlocked, s.albedo) + greenhouse(s.co2, s.waterVapor);
   s.surfaceTemp = T;
 
   // 10. Ice & ocean coverage relax toward temperature-set targets. Oceans
@@ -244,13 +259,16 @@ export function atmosphereInfo(s) {
 // Impactor catalog — comets/asteroids carry different volatiles, so the
 // player can build a specific kind of world by choosing what to throw at
 // it. `color` tints the comet + trail; `apply` deposits its payload.
+// Every impact also kicks up some dust into the upper atmosphere (an
+// impact-winter effect, same s.dust pool a nuke's fallout uses) — a sooty
+// carbonaceous body throws up the most, an icy one the least.
 export const COMET_TYPES = [
   { id: 'ice',     label: '❄ Icy — water',      color: 0xbfe6ff,
-    apply: (s) => { s.waterMass += 0.18; s.co2 += 0.02; } },
+    apply: (s) => { s.waterMass += 0.18; s.co2 += 0.02; s.dust = clamp01(s.dust + 0.04); } },
   { id: 'carbon',  label: '⬤ Carbonaceous — CO₂', color: 0x7a6450,
-    apply: (s) => { s.co2 += 0.22; s.n2 += 0.03; s.waterMass += 0.03; } },
+    apply: (s) => { s.co2 += 0.22; s.n2 += 0.03; s.waterMass += 0.03; s.dust = clamp01(s.dust + 0.10); } },
   { id: 'ammonia', label: '◇ Ammonia — N₂',      color: 0x8fe6d6,
-    apply: (s) => { s.n2 += 0.20; s.waterMass += 0.04; s.co2 += 0.02; } },
+    apply: (s) => { s.n2 += 0.20; s.waterMass += 0.04; s.co2 += 0.02; s.dust = clamp01(s.dust + 0.05); } },
 ];
 
 // Deposit the chosen impactor's payload into the planet.
