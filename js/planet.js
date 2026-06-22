@@ -71,6 +71,15 @@ const MAX_CITIES = FOUND_CITIES + RESEED_NEW_CITIES;   // hard ceiling once colo
 // enough for civilization to climb again, so the war cycle simply repeats.
 const BIO_GONE_THRESHOLD = 0.02;   // biosphere below this counts as "no life at all"
 const BIO_GONE_WIPE_MYR = 15;      // sustained Myr of bio-loss before ruins are wiped
+// A full recolor does an O(seeds) nearest-city search per pixel over the
+// whole S×S canvas (~100ms+ on a 512² world) — fine once, but a volatile
+// climate (a war's repeated nuke/dust swings, fast-forwarding) can cross the
+// magnitude thresholds below on every single frame, which would otherwise
+// re-trigger that expensive pass 60 times a second. This wall-clock floor
+// debounces it to a fixed cadence instead; forced resets (founding/reseed/
+// wipe, which null out _last) skip the cooldown since those are rare,
+// one-shot events where an immediate repaint actually matters.
+const RECOLOR_MIN_INTERVAL_MS = 120;
 const clamp = (x,a,b) => x<a?a:x>b?b:x;
 function smooth(e0,e1,x){ const t=clamp((x-e0)/(e1-e0),0,1); return t*t*(3-2*t); }
 
@@ -162,6 +171,7 @@ export class PlanetView {
     this._bioGoneMyr = 0;       // running Myr of sustained biosphere absence, while cities exist
     this._last = null;
     this._lastScorch = null;
+    this._lastRecolorAt = 0;    // performance.now() of the last full recolor — see RECOLOR_MIN_INTERVAL_MS
     this._diffuseCanvas = null; this._emissiveCanvas = null;   // cached for the scorch-only fast path
     this._baseDiffuseData = null; this._baseEmissiveData = null;
 
@@ -1123,7 +1133,12 @@ export class PlanetView {
       }
     }
 
-    if (changed || !this._diffuseCanvas) {
+    // `!L` means _last was explicitly nulled (founding/reseed/wipe) — those
+    // are rare one-shot events that want an immediate repaint regardless of
+    // the cooldown (see RECOLOR_MIN_INTERVAL_MS above); everything else
+    // (organic climate drift) is debounced to that fixed cadence.
+    const recolorDue = !L || performance.now() - this._lastRecolorAt >= RECOLOR_MIN_INTERVAL_MS;
+    if ((changed || !this._diffuseCanvas) && recolorDue) {
       // full recolor: structural state moved (sea level, climate, biosphere,
       // civilization) — redo all three S×S passes, and stash the pre-scorch
       // pixel data + live canvases so a later scorch-only change (below) can
@@ -1146,6 +1161,7 @@ export class PlanetView {
       this._baseDiffuseData = baseDiffuseData; this._baseEmissiveData = baseEmissiveData;
       this._last = v;
       this._lastScorch = scorchVec;
+      this._lastRecolorAt = performance.now();
     } else if (scorchChanged) {
       // war damage only: repaint just the scorched cities' footprints from
       // the cached pre-scorch pixels — no S×S recompute, no per-pixel
